@@ -1,2 +1,0 @@
-!pip install -q gradio transformers torch black autopep8 reportlab requests
-!pip install -q gradio transformers torch black autopep8 reportlab requests sqlite3
