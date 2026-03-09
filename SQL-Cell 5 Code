@@ -1,0 +1,298 @@
+import gradio as gr
+from datetime import datetime
+from pathlib import Path
+import json
+import sqlite3
+import re
+import urllib.parse
+
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+
+# =========================================================
+# DATABASE SCHEMA
+# =========================================================
+
+SCHEMA = {
+    "users": {
+        "id": "INTEGER PRIMARY KEY",
+        "name": "TEXT",
+        "email": "TEXT",
+        "signup_date": "DATE",
+        "age": "INTEGER",
+        "country": "TEXT",
+        "status": "TEXT",
+    },
+    "orders": {
+        "id": "INTEGER PRIMARY KEY",
+        "user_id": "INTEGER",
+        "product_name": "TEXT",
+        "amount": "REAL",
+        "order_date": "DATE",
+        "status": "TEXT",
+    },
+    "products": {
+        "id": "INTEGER PRIMARY KEY",
+        "name": "TEXT",
+        "price": "REAL",
+        "category": "TEXT",
+        "stock": "INTEGER",
+    },
+    "transactions": {
+        "id": "INTEGER PRIMARY KEY",
+        "user_id": "INTEGER",
+        "amount": "REAL",
+        "date": "DATE",
+        "type": "TEXT",
+    },
+}
+
+# =========================================================
+# SECURITY
+# =========================================================
+
+DANGEROUS_KEYWORDS = [
+    "DROP",
+    "DELETE",
+    "ALTER",
+    "TRUNCATE",
+    "INSERT",
+    "UPDATE",
+    "EXEC",
+    "EXECUTE",
+]
+
+DANGEROUS_CHARS = [";", "--", "/*", "*/", "xp_", "sp_"]
+
+
+def is_safe(text):
+    text_upper = text.upper()
+    for keyword in DANGEROUS_KEYWORDS:
+        if keyword in text_upper:
+            return False
+    for char in DANGEROUS_CHARS:
+        if char in text:
+            return False
+    return True
+
+
+# =========================================================
+# TABLE DETECTION
+# =========================================================
+
+def get_table_name(query_text):
+    query_lower = query_text.lower()
+
+    keyword_map = {
+        "users": ["user", "users", "customer", "customers", "account"],
+        "orders": ["order", "orders", "purchase", "buy"],
+        "products": ["product", "products", "item", "items"],
+        "transactions": ["transaction", "transactions", "payment"],
+    }
+
+    for table, keywords in keyword_map.items():
+        for kw in keywords:
+            if kw in query_lower:
+                return table
+
+    return "users"
+
+
+def get_column_names(table, query_text):
+    columns = list(SCHEMA[table].keys())
+    query_lower = query_text.lower()
+
+    selected_cols = []
+    for col in columns:
+        if col.lower() in query_lower:
+            selected_cols.append(col)
+
+    if not selected_cols:
+        return ["*"]
+
+    return list(dict.fromkeys(selected_cols))
+
+
+# =========================================================
+# WHERE CONDITIONS
+# =========================================================
+
+def extract_conditions(query_text):
+    query_lower = query_text.lower()
+    conditions = []
+
+    # last month
+    if "last month" in query_lower:
+        conditions.append("DATE(signup_date) >= DATE('now','-1 month')")
+
+    # last year
+    if "last year" in query_lower or "this year" in query_lower:
+        conditions.append("DATE(signup_date) >= DATE('now','-1 year')")
+
+    # today
+    if "today" in query_lower:
+        conditions.append("DATE(signup_date) = DATE('now')")
+
+    # active/inactive
+    if "active" in query_lower:
+        conditions.append("status = 'active'")
+    elif "inactive" in query_lower:
+        conditions.append("status = 'inactive'")
+
+    # amount filtering
+    match = re.search(r"(greater than|more than|above)\s*(\d+)", query_lower)
+    if match:
+        conditions.append(f"amount > {match.group(2)}")
+
+    match = re.search(r"(less than|below)\s*(\d+)", query_lower)
+    if match:
+        conditions.append(f"amount < {match.group(2)}")
+
+    return conditions
+
+
+# =========================================================
+# SQL GENERATOR
+# =========================================================
+
+def generate_sql(query_text):
+    if not is_safe(query_text):
+        return None, "❌ UNSAFE: Query contains dangerous SQL keywords!"
+
+    table = get_table_name(query_text)
+    columns = get_column_names(table, query_text)
+    columns_str = ", ".join(columns)
+
+    sql = f"SELECT {columns_str} FROM {table}"
+
+    conditions = extract_conditions(query_text)
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+
+    if "all" not in query_text.lower():
+        sql += " LIMIT 10"
+
+    return sql, f"✅ Generated from table '{table}'"
+
+
+# =========================================================
+# CHAT PROCESS
+# =========================================================
+
+query_history = []
+
+
+def process_query(user_query, chat_history):
+    if not user_query.strip():
+        return chat_history
+
+    chat_history.append((user_query, "Processing..."))
+
+    sql_query, explanation = generate_sql(user_query)
+
+    if sql_query is None:
+        response = f"❌ ERROR\n\n{explanation}"
+    else:
+        response = f"✅ SQL GENERATED\n\n```sql\n{sql_query}\n```\n\n{explanation}"
+        query_history.append(
+            {
+                "user": user_query,
+                "sql": sql_query,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
+
+    chat_history[-1] = (user_query, response)
+    return chat_history
+
+
+# =========================================================
+# EXPORT PDF
+# =========================================================
+
+def export_pdf():
+    if not query_history:
+        return "❌ No queries to export", None
+
+    filename = f"sql_queries_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+    doc = SimpleDocTemplate(filename, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("SQL Query Report", styles["Heading1"]))
+    story.append(Spacer(1, 0.25 * inch))
+
+    for q in query_history[-5:]:
+        story.append(Paragraph(f"<b>User:</b> {q['user']}", styles["Normal"]))
+        story.append(Paragraph(f"<b>SQL:</b> {q['sql']}", styles["Normal"]))
+        story.append(Spacer(1, 0.2 * inch))
+
+    doc.build(story)
+
+    return f"✅ PDF Downloaded: {filename}", filename
+
+
+# =========================================================
+# WHATSAPP LINK
+# =========================================================
+
+def generate_whatsapp_link():
+    if not query_history:
+        return "❌ No queries to share"
+
+    message = "📊 SQL Queries Generated\n\n"
+
+    for i, q in enumerate(query_history[-5:], 1):
+        message += f"*Query {i}:* {q['user']}\n"
+        message += f"{q['sql']}\n\n"
+
+    encoded = urllib.parse.quote(message)
+    link = f"https://wa.me/?text={encoded}"
+
+    return f"✅ WhatsApp Link Created\n\n🔗 {link}"
+
+
+# =========================================================
+# UI
+# =========================================================
+
+with gr.Blocks() as demo:
+    gr.Markdown(
+        "## 🚀 Natural Language → SQLite SQL\n"
+        "Convert plain English requests into safe SQL queries!"
+    )
+
+    chatbot = gr.Chatbot(height=450)
+
+    query_input = gr.Textbox(
+        label="Natural Language Request",
+        placeholder="e.g., Show me all users who signed up last month",
+    )
+
+    with gr.Row():
+        submit_btn = gr.Button("Generate SQL")
+        pdf_btn = gr.Button("Download PDF")
+        wa_btn = gr.Button("Share WhatsApp")
+
+    file_output = gr.File()
+    status = gr.Markdown()
+
+    submit_btn.click(process_query, [query_input, chatbot], chatbot)
+    pdf_btn.click(export_pdf, outputs=[status, file_output])
+    wa_btn.click(generate_whatsapp_link, outputs=status)
+
+# =========================================================
+# LAUNCH
+# =========================================================
+
+demo.launch(share=True, show_error=True, show_api=False)
